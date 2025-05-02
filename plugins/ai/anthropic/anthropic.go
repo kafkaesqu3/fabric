@@ -2,17 +2,17 @@ package anthropic
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/danielmiessler/fabric/common"
 	"github.com/danielmiessler/fabric/plugins"
 	goopenai "github.com/sashabaranov/go-openai"
-
-	"github.com/danielmiessler/fabric/common"
-	"github.com/liushuangls/go-anthropic/v2"
 )
 
-const baseUrl = "https://api.anthropic.com/v1"
+const defaultBaseUrl = "https://api.anthropic.com/"
 
 func NewClient() (ret *Client) {
 	vendorName := "Anthropic"
@@ -25,16 +25,19 @@ func NewClient() (ret *Client) {
 	}
 
 	ret.ApiBaseURL = ret.AddSetupQuestion("API Base URL", false)
-	ret.ApiBaseURL.Value = baseUrl
+	ret.ApiBaseURL.Value = defaultBaseUrl
 	ret.ApiKey = ret.PluginBase.AddSetupQuestion("API key", true)
 
-	// we could provide a setup question for the following settings
 	ret.maxTokens = 4096
 	ret.defaultRequiredUserMessage = "Hi"
 	ret.models = []string{
-		string(anthropic.ModelClaude3Dot5HaikuLatest), string(anthropic.ModelClaude3Opus20240229),
-		string(anthropic.ModelClaude3Opus20240229), string(anthropic.ModelClaude2Dot0), string(anthropic.ModelClaude2Dot1),
-		string(anthropic.ModelClaude3Dot5SonnetLatest), string(anthropic.ModelClaude3Dot5HaikuLatest),
+		anthropic.ModelClaude3_7SonnetLatest, anthropic.ModelClaude3_7Sonnet20250219,
+		anthropic.ModelClaude3_5HaikuLatest, anthropic.ModelClaude3_5Haiku20241022,
+		anthropic.ModelClaude3_5SonnetLatest, anthropic.ModelClaude3_5Sonnet20241022,
+		anthropic.ModelClaude_3_5_Sonnet_20240620, anthropic.ModelClaude3OpusLatest,
+		anthropic.ModelClaude_3_Opus_20240229, anthropic.ModelClaude_3_Sonnet_20240229,
+		anthropic.ModelClaude_3_Haiku_20240307, anthropic.ModelClaude_2_1,
+		anthropic.ModelClaude_2_0,
 	}
 
 	return
@@ -49,14 +52,26 @@ type Client struct {
 	defaultRequiredUserMessage string
 	models                     []string
 
-	client *anthropic.Client
+	client anthropic.Client
 }
 
 func (an *Client) configure() (err error) {
 	if an.ApiBaseURL.Value != "" {
-		an.client = anthropic.NewClient(an.ApiKey.Value, anthropic.WithBaseURL(an.ApiBaseURL.Value))
+		baseURL := an.ApiBaseURL.Value
+
+		// As of 2.0beta1, using v2 API endpoint.
+		// https://github.com/anthropics/anthropic-sdk-go/blob/main/CHANGELOG.md#020-beta1-2025-03-25
+		if strings.Contains(baseURL, "-") && !strings.HasSuffix(baseURL, "/v2") {
+			baseURL = strings.TrimSuffix(baseURL, "/")
+			baseURL = baseURL + "/v2"
+		}
+
+		an.client = anthropic.NewClient(
+			option.WithAPIKey(an.ApiKey.Value),
+			option.WithBaseURL(baseURL),
+		)
 	} else {
-		an.client = anthropic.NewClient(an.ApiKey.Value)
+		an.client = anthropic.NewClient(option.WithAPIKey(an.ApiKey.Value))
 	}
 	return
 }
@@ -68,75 +83,60 @@ func (an *Client) ListModels() (ret []string, err error) {
 func (an *Client) SendStream(
 	msgs []*goopenai.ChatCompletionMessage, opts *common.ChatOptions, channel chan string,
 ) (err error) {
-	ctx := context.Background()
-	req := an.buildMessagesRequest(msgs, opts)
-	req.Stream = true
+	messages := an.toMessages(msgs)
 
-	if _, err = an.client.CreateMessagesStream(ctx, anthropic.MessagesStreamRequest{
-		MessagesRequest: req,
-		OnContentBlockDelta: func(data anthropic.MessagesEventContentBlockDeltaData) {
-			// fmt.Printf("Stream Content: %s\n", data.Delta.Text)
-			channel <- *data.Delta.Text
-		},
-	}); err != nil {
-		var e *anthropic.APIError
-		if errors.As(err, &e) {
-			fmt.Printf("Messages stream error, type: %s, message: %s", e.Type, e.Message)
-		} else {
-			fmt.Printf("Messages stream error: %v\n", err)
+	ctx := context.Background()
+	stream := an.client.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
+		Model:       opts.Model,
+		MaxTokens:   int64(an.maxTokens),
+		TopP:        anthropic.Opt(opts.TopP),
+		Temperature: anthropic.Opt(opts.Temperature),
+		Messages:    messages,
+	})
+
+	for stream.Next() {
+		event := stream.Current()
+
+		// directly send any non-empty delta text
+		if event.Delta.Text != "" {
+			channel <- event.Delta.Text
 		}
-	} else {
-		close(channel)
 	}
+
+	if stream.Err() != nil {
+		fmt.Printf("Messages stream error: %v\n", stream.Err())
+	}
+	close(channel)
 	return
 }
 
 func (an *Client) Send(ctx context.Context, msgs []*goopenai.ChatCompletionMessage, opts *common.ChatOptions) (ret string, err error) {
-	req := an.buildMessagesRequest(msgs, opts)
-	req.Stream = false
-
-	var resp anthropic.MessagesResponse
-	if resp, err = an.client.CreateMessages(ctx, req); err == nil {
-		ret = *resp.Content[0].Text
-	} else {
-		var e *anthropic.APIError
-		if errors.As(err, &e) {
-			fmt.Printf("Messages error, type: %s, message: %s", e.Type, e.Message)
-		} else {
-			fmt.Printf("Messages error: %v\n", err)
-		}
-	}
-	return
-}
-
-func (an *Client) buildMessagesRequest(msgs []*goopenai.ChatCompletionMessage, opts *common.ChatOptions) (ret anthropic.MessagesRequest) {
-	temperature := float32(opts.Temperature)
-	topP := float32(opts.TopP)
-
 	messages := an.toMessages(msgs)
 
-	ret = anthropic.MessagesRequest{
-		Model:       anthropic.Model(opts.Model),
-		Temperature: &temperature,
-		TopP:        &topP,
+	var message *anthropic.Message
+	if message, err = an.client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:       opts.Model,
+		MaxTokens:   int64(an.maxTokens),
+		TopP:        anthropic.Opt(opts.TopP),
+		Temperature: anthropic.Opt(opts.Temperature),
 		Messages:    messages,
-		MaxTokens:   an.maxTokens,
+	}); err != nil {
+		return
 	}
+	ret = message.Content[0].Text
 	return
 }
 
-func (an *Client) toMessages(msgs []*goopenai.ChatCompletionMessage) (ret []anthropic.Message) {
-	// we could call the method before calling the specific vendor
+func (an *Client) toMessages(msgs []*goopenai.ChatCompletionMessage) (ret []anthropic.MessageParam) {
 	normalizedMessages := common.NormalizeMessages(msgs, an.defaultRequiredUserMessage)
 
-	// Iterate over the incoming session messages and process them
 	for _, msg := range normalizedMessages {
-		var message anthropic.Message
+		var message anthropic.MessageParam
 		switch msg.Role {
 		case goopenai.ChatMessageRoleUser:
-			message = anthropic.NewUserTextMessage(msg.Content)
+			message = anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Content))
 		default:
-			message = anthropic.NewAssistantTextMessage(msg.Content)
+			message = anthropic.NewAssistantMessage(anthropic.NewTextBlock(msg.Content))
 		}
 		ret = append(ret, message)
 	}

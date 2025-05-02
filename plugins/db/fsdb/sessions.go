@@ -2,6 +2,7 @@ package fsdb
 
 import (
 	"fmt"
+
 	"github.com/danielmiessler/fabric/common"
 	goopenai "github.com/sashabaranov/go-openai"
 )
@@ -58,8 +59,7 @@ func (o *Session) Append(messages ...*goopenai.ChatCompletionMessage) {
 }
 
 func (o *Session) GetVendorMessages() (ret []*goopenai.ChatCompletionMessage) {
-	if o.vendorMessages == nil {
-		o.vendorMessages = []*goopenai.ChatCompletionMessage{}
+	if len(o.vendorMessages) == 0 {
 		for _, message := range o.Messages {
 			o.appendVendorMessage(message)
 		}

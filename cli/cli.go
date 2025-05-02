@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
-	"github.com/danielmiessler/fabric/plugins/tools/youtube"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/danielmiessler/fabric/plugins/tools/youtube"
 
 	"github.com/danielmiessler/fabric/common"
 	"github.com/danielmiessler/fabric/core"
@@ -42,7 +44,10 @@ func Cli(version string) (err error) {
 		}
 	}
 
-	registry := core.NewPluginRegistry(fabricDb)
+	var registry *core.PluginRegistry
+	if registry, err = core.NewPluginRegistry(fabricDb); err != nil {
+		return
+	}
 
 	// if the setup flag is set, run the setup function
 	if currentFlags.Setup {
@@ -51,7 +56,14 @@ func Cli(version string) (err error) {
 	}
 
 	if currentFlags.Serve {
-		err = restapi.Serve(registry, currentFlags.ServeAddress)
+		registry.ConfigureVendors()
+		err = restapi.Serve(registry, currentFlags.ServeAddress, currentFlags.ServeAPIKey)
+		return
+	}
+
+	if currentFlags.ServeOllama {
+		registry.ConfigureVendors()
+		err = restapi.ServeOllama(registry, currentFlags.ServeAddress, version)
 		return
 	}
 
@@ -61,7 +73,10 @@ func Cli(version string) (err error) {
 	}
 
 	if currentFlags.ChangeDefaultModel {
-		err = registry.Defaults.Setup()
+		if err = registry.Defaults.Setup(); err != nil {
+			return
+		}
+		err = registry.SaveEnvFile()
 		return
 	}
 
@@ -78,7 +93,7 @@ func Cli(version string) (err error) {
 	}
 
 	if currentFlags.ListPatterns {
-		err = fabricDb.Patterns.ListNames()
+		err = fabricDb.Patterns.ListNames(currentFlags.ShellCompleteOutput)
 		return
 	}
 
@@ -87,17 +102,17 @@ func Cli(version string) (err error) {
 		if models, err = registry.VendorManager.GetModels(); err != nil {
 			return
 		}
-		models.Print()
+		models.Print(currentFlags.ShellCompleteOutput)
 		return
 	}
 
 	if currentFlags.ListAllContexts {
-		err = fabricDb.Contexts.ListNames()
+		err = fabricDb.Contexts.ListNames(currentFlags.ShellCompleteOutput)
 		return
 	}
 
 	if currentFlags.ListAllSessions {
-		err = fabricDb.Sessions.ListNames()
+		err = fabricDb.Sessions.ListNames(currentFlags.ShellCompleteOutput)
 		return
 	}
 
@@ -129,6 +144,31 @@ func Cli(version string) (err error) {
 		}
 	}
 
+	if currentFlags.ListExtensions {
+		err = registry.TemplateExtensions.ListExtensions()
+		return
+	}
+
+	if currentFlags.AddExtension != "" {
+		err = registry.TemplateExtensions.RegisterExtension(currentFlags.AddExtension)
+		return
+	}
+
+	if currentFlags.RemoveExtension != "" {
+		err = registry.TemplateExtensions.RemoveExtension(currentFlags.RemoveExtension)
+		return
+	}
+
+	if currentFlags.ListStrategies {
+		err = registry.Strategies.ListStrategies(currentFlags.ShellCompleteOutput)
+		return
+	}
+
+	if currentFlags.ListVendors {
+		err = registry.ListVendors(os.Stdout)
+		return
+	}
+
 	// if the interactive flag is set, run the interactive function
 	// if currentFlags.Interactive {
 	// 	interactive.Interactive()
@@ -139,7 +179,7 @@ func Cli(version string) (err error) {
 	var messageTools string
 
 	if currentFlags.YouTube != "" {
-		if registry.YouTube.IsConfigured() == false {
+		if !registry.YouTube.IsConfigured() {
 			err = fmt.Errorf("YouTube is not configured, please run the setup procedure")
 			return
 		}
@@ -176,7 +216,9 @@ func Cli(version string) (err error) {
 			return
 		}
 
-		messageTools, err = processYoutubeVideo(currentFlags, registry, videoId)
+		if messageTools, err = processYoutubeVideo(currentFlags, registry, videoId); err != nil {
+			return
+		}
 		if !currentFlags.IsChatRequest() {
 			err = currentFlags.WriteOutput(messageTools)
 			return
@@ -214,7 +256,7 @@ func Cli(version string) (err error) {
 	}
 
 	var chatter *core.Chatter
-	if chatter, err = registry.GetChatter(currentFlags.Model, currentFlags.ModelContextLength, currentFlags.Stream, currentFlags.DryRun); err != nil {
+	if chatter, err = registry.GetChatter(currentFlags.Model, currentFlags.ModelContextLength, currentFlags.Strategy, currentFlags.Stream, currentFlags.DryRun); err != nil {
 		return
 	}
 
@@ -260,7 +302,7 @@ func Cli(version string) (err error) {
 func processYoutubeVideo(
 	flags *Flags, registry *core.PluginRegistry, videoId string) (message string, err error) {
 
-	if !flags.YouTubeComments || flags.YouTubeTranscript {
+	if (!flags.YouTubeComments && !flags.YouTubeMetadata) || flags.YouTubeTranscript || flags.YouTubeTranscriptWithTimestamps {
 		var transcript string
 		var language = "en"
 		if flags.Language != "" || registry.Language.DefaultLanguage.Value != "" {
@@ -270,8 +312,14 @@ func processYoutubeVideo(
 				language = registry.Language.DefaultLanguage.Value
 			}
 		}
-		if transcript, err = registry.YouTube.GrabTranscript(videoId, language); err != nil {
-			return
+		if flags.YouTubeTranscriptWithTimestamps {
+			if transcript, err = registry.YouTube.GrabTranscriptWithTimestamps(videoId, language); err != nil {
+				return
+			}
+		} else {
+			if transcript, err = registry.YouTube.GrabTranscript(videoId, language); err != nil {
+				return
+			}
 		}
 		message = AppendMessage(message, transcript)
 	}
@@ -286,6 +334,16 @@ func processYoutubeVideo(
 
 		message = AppendMessage(message, commentsString)
 	}
+
+	if flags.YouTubeMetadata {
+		var metadata *youtube.VideoMetadata
+		if metadata, err = registry.YouTube.GrabMetadata(videoId); err != nil {
+			return
+		}
+		metadataJson, _ := json.MarshalIndent(metadata, "", "  ")
+		message = AppendMessage(message, string(metadataJson))
+	}
+
 	return
 }
 
